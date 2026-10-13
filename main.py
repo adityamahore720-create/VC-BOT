@@ -1,12 +1,13 @@
 """
-24/7 VC Userbot - Telegram bot panel (photo + buttons + OTP login)
+24/7 VC Userbot - Telegram bot panel (photo + buttons + OTP login + AUTO-JOIN)
 Env: API_ID, API_HASH, BOT_TOKEN, OWNER_ID, PORT (host deta hai)
 Optional: SESSION_STRING, TARGET_ID, AUTO_START (default 1)
 """
-import asyncio, json, logging, os, re, sys, wave
+import asyncio, json, logging, os, re, sys, time, wave
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)      # Pyrogram isi loop par chalega (important fix)
+asyncio.set_event_loop(loop)      # Pyrogram isi loop par chalega (important)
+
 from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.errors import (SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
@@ -38,7 +39,8 @@ if os.getenv("SESSION_STRING") and os.getenv("TARGET_ID") and os.getenv("AUTO_ST
 
 bot = Client("controller", API_ID, API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 user = call = None
-st = {"mode": None, "panel": None}      # mode: phone / code / pass / target
+flags = {"joined": False}                # abhi VC me hai ya nahi
+st = {"mode": None, "panel": None}       # mode: phone / code / pass / target
 lg = {"client": None, "phone": None, "hash": None}
 
 # ---------------- VC ----------------
@@ -48,45 +50,88 @@ def make_silence():
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
             w.writeframes(b"\x00\x00" * 16000 * 60)
 
-async def join():
+def is_no_vc(e):
+    s = (type(e).__name__ + " " + str(e)).lower()
+    return any(k in s for k in ("noactivegroupcall", "no active group", "group call", "groupcall",
+                                "voice chat", "videochat", "not started"))
+
+async def ensure_client():
     global user, call
+    if call is not None: return
+    make_silence()
+    u = Client("vc_user", API_ID, API_HASH, session_string=data["session"], in_memory=True)
+    c = PyTgCalls(u)
+
+    @c.on_update(tgf.stream_end())
+    async def _loop(_, upd):
+        await c.play(upd.chat_id, MediaStream(SIL, video_flags=MediaStream.Flags.IGNORE))
+
+    try:
+        await c.start()
+    except Exception:
+        try: await u.stop()
+        except Exception: pass
+        raise
+    user, call = u, c
+
+async def try_join():
+    """True = VC me hai, False = VC abhi on nahi hai. Baaki errors raise hote hain."""
     if not data["session"]: raise Exception("Pehle account login karo")
     if not data["target"]:  raise Exception("Pehle target ID set karo")
-    make_silence()
-    if user is None:
-        user = Client("vc_user", API_ID, API_HASH, session_string=data["session"], in_memory=True)
-        call = PyTgCalls(user)
-
-        @call.on_update(tgf.stream_end())
-        async def _loop(_, u):
-            await call.play(u.chat_id, MediaStream(SIL, video_flags=MediaStream.Flags.IGNORE))
-
-        await call.start()
+    await ensure_client()
     tid = int(data["target"])
     try: await user.get_chat(tid)
-    except Exception: pass
-    await call.play(tid, MediaStream(SIL, video_flags=MediaStream.Flags.IGNORE))
-    data["running"] = True; save()
+    except Exception as e: logging.warning("get_chat fail: %r", e)
+    try:
+        await call.play(tid, MediaStream(SIL, video_flags=MediaStream.Flags.IGNORE))
+    except Exception as e:
+        if is_no_vc(e):
+            flags["joined"] = False
+            return False
+        flags["joined"] = False
+        raise
+    flags["joined"] = True
+    return True
 
-async def leave():
-    if call and data["target"]:
-        try: await call.leave_call(int(data["target"]))
+async def leave_chat(tid):
+    if call and tid:
+        try: await call.leave_call(int(tid))
         except Exception: pass
-    data["running"] = False; save()
+    flags["joined"] = False
 
 async def full_logout():
     global user, call
-    await leave()
+    data["running"] = False; save()
+    await leave_chat(data["target"])
     if user:
         try: await user.stop()
         except Exception: pass
     user = call = None
     data.update(session=None, running=False); save()
 
+async def watcher():
+    """Har 10s check: VC start hote hi auto-join. Join ke baad 2 min me ek baar health check."""
+    last = 0
+    while True:
+        await asyncio.sleep(10)
+        try:
+            if not (data["running"] and data["session"] and data["target"]): continue
+            gap = 120 if flags["joined"] else 10
+            if time.time() - last < gap: continue
+            last = time.time()
+            before = flags["joined"]
+            await try_join()
+            if flags["joined"] != before and st["mode"] is None:
+                await setcap(caption(), home_kb())
+        except Exception as e:
+            logging.warning("watcher: %r", e)
+
 # ---------------- UI ----------------
 def caption(extra=""):
     acc = "✅ Connected" if data["session"] else "❌ Not logged in"
-    run = "🟢 Running" if data["running"] else "🔴 Stopped"
+    if data["running"] and flags["joined"]: run = "🟢 VC me hai"
+    elif data["running"]:                   run = "🟡 VC start hone ka wait (auto-join ON)"
+    else:                                   run = "🔴 Stopped"
     t = (f"🎙 **24/7 VC Panel**\n\n👤 Account: {acc}\n"
          f"🎯 Target: `{data['target'] or 'Not set'}`\n📡 Status: {run}")
     return t + (f"\n\n{extra}" if extra else "")
@@ -144,21 +189,37 @@ async def on_cb(_, q):
         await setcap(caption("🎯 Group/Channel ID bhejo\n(jaise `-1001234567890`)"), back_kb)
         await q.answer()
     elif d == "start":
-        try: await join(); await q.answer("VC join ho gaya ✅", show_alert=True)
-        except Exception as e: await q.answer(f"Error: {e}"[:190], show_alert=True)
+        if not data["session"] or not data["target"]:
+            await q.answer("Pehle login karo aur target set karo", show_alert=True); return
+        data["running"] = True; save()
+        try:
+            ok = await try_join()
+            msg = ("VC join ho gaya ✅" if ok else
+                   "VC abhi off hai ⏳\nAuto-join ON hai: VC start hote hi account khud join ho jayega.")
+            await q.answer(msg, show_alert=True)
+        except Exception as e:
+            logging.exception("join fail")
+            await q.answer(f"{type(e).__name__}: {e}"[:190], show_alert=True)
         await home()
     elif d == "stop":
-        await leave(); await q.answer("VC chhod diya 🔴", show_alert=True); await home()
+        data["running"] = False; save()
+        await leave_chat(data["target"])
+        await q.answer("VC chhod diya 🔴 (auto-join band)", show_alert=True); await home()
     elif d == "logout":
         await full_logout(); await q.answer("Logout ho gaya", show_alert=True); await home()
     elif d == "sess":
-        s = await bot.send_message(q.message.chat.id,
+        await bot.send_message(q.message.chat.id,
             f"🔐 Session String (kisi ko mat dena, Render ke `SESSION_STRING` me daalo, phir ye message delete kar do):\n\n`{data['session']}`")
         await q.answer()
 
 async def finish_login():
     data["session"] = await lg["client"].export_session_string()
     await cancel_login(); save()
+
+async def join_later():
+    try: await try_join()
+    except Exception as e: logging.warning("join_later: %r", e)
+    if st["mode"] is None: await setcap(caption(), home_kb())
 
 @bot.on_message(filters.private & owner & filters.text & ~filters.command(["start"]))
 async def on_text(_, m):
@@ -187,9 +248,14 @@ async def on_text(_, m):
             await lg["client"].check_password(txt)
             await finish_login(); await home("✅ Login ho gaya! Ab 🎯 target set karo.")
         elif mode == "target":
-            int(txt)                 # check valid number
-            data["target"] = txt; save()
-            await home("✅ Target save ho gaya.")
+            int(txt)                 # valid number check
+            old = data["target"]
+            if old and old != txt: await leave_chat(old)
+            data["target"] = txt
+            if data["session"]: data["running"] = True     # auto-join ON
+            save(); flags["joined"] = False
+            await home("✅ Target save. Auto-join ON: VC start hote hi account khud join ho jayega.")
+            if data["session"]: asyncio.create_task(join_later())
     except PhoneNumberInvalid:
         await setcap(caption("❌ Number galat hai. Dobara bhejo (+91...)."), back_kb)
     except (PhoneCodeInvalid, PhoneCodeExpired):
@@ -222,9 +288,7 @@ async def main():
         st["panel"] = (sent.chat.id, sent.id)
     except Exception as e:
         print("Owner ko panel nahi bheja (bot me pehle /start dabao, OWNER_ID check karo):", repr(e))
-    if data["session"] and data["target"] and data["running"]:
-        try: await join()
-        except Exception as e: print("auto-join fail:", e)
+    asyncio.create_task(watcher())       # auto-join watcher
     print("Bot ready")
     await asyncio.Event().wait()
 
