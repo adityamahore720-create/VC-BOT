@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VC Panel</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;font-family:system-ui,sans-serif;color:#fff;
+ background:linear-gradient(#0008,#000b),url(/bg.jpg) center/cover fixed no-repeat;
+ display:flex;align-items:center;justify-content:center;padding:16px}
+.card{width:100%;max-width:400px;padding:22px;border-radius:20px;
+ background:#ffffff1a;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+ border:1px solid #ffffff33;box-shadow:0 10px 40px #0008}
+h1{margin:0 0 4px;font-size:22px} .sub{opacity:.7;font-size:13px;margin-bottom:16px}
+input{width:100%;padding:12px;margin:6px 0;border-radius:12px;border:1px solid #ffffff44;
+ background:#0006;color:#fff;font-size:15px;outline:none}
+button{width:100%;padding:12px;margin:6px 0;border:0;border-radius:12px;color:#fff;
+ font-size:15px;font-weight:600;cursor:pointer}
+.blue{background:#2563eb}.green{background:#16a34a}.red{background:#dc2626}.gray{background:#ffffff33}
+.row{display:flex;gap:8px}.row button{flex:1}
+.badge{display:inline-block;padding:4px 10px;border-radius:99px;font-size:12px;margin:2px 4px 8px 0;background:#ffffff26}
+#msg{margin-top:10px;font-size:13px;min-height:18px;text-align:center}
+.hide{display:none}
+</style></head><body>
+<div class="card">
+ <h1>🎙 24/7 VC Panel</h1><div class="sub">Account login karo, target set karo, VC chalu rakho</div>
+
+ <div id="gate">
+  <input id="pp" type="password" placeholder="Panel password">
+  <button class="blue" onclick="enter()">Enter</button>
+ </div>
+
+ <div id="login" class="hide">
+  <div id="s1"><input id="phone" placeholder="Phone (+919999999999)">
+   <button class="blue" onclick="sendCode()">📲 OTP bhejo</button></div>
+  <div id="s2" class="hide"><input id="code" placeholder="OTP code">
+   <button class="green" onclick="verify()">✅ Verify OTP</button></div>
+  <div id="s3" class="hide"><input id="pw" type="password" placeholder="2-step password">
+   <button class="green" onclick="pwd()">🔐 Login</button></div>
+ </div>
+
+ <div id="dash" class="hide">
+  <span class="badge">👤 Account: Connected</span><span class="badge" id="st">⚪ Stopped</span>
+  <input id="target" placeholder="Channel / Group ID (-100...)">
+  <button class="gray" onclick="saveTarget()">🎯 Save Target</button>
+  <div class="row"><button class="green" onclick="act('start')">🟢 Start VC</button>
+  <button class="red" onclick="act('stop')">🔴 Stop VC</button></div>
+  <button class="blue" onclick="getSession()">📋 Copy Session String</button>
+  <button class="gray" onclick="act('logout')">🚪 Logout Account</button>
+ </div>
+ <div id="msg"></div>
+</div>
+<script>
+let P=sessionStorage.getItem('p')||'';
+const $=id=>document.getElementById(id), show=(i,v)=>$(i).classList.toggle('hide',!v);
+const say=(t,e)=>{$('msg').textContent=t;$('msg').style.color=e?'#fca5a5':'#bbf7d0'};
+async function api(path,body){
+ const r=await fetch('/api/'+path,{method:body!==undefined?'POST':'GET',
+  headers:{'X-Pass':P,'Content-Type':'application/json'},body:body!==undefined?JSON.stringify(body):undefined});
+ if(!r.ok) throw new Error(await r.text()||r.status); return r.json();
+}
+async function enter(){P=$('pp').value||P;try{await refresh();sessionStorage.setItem('p',P)}catch(e){say(e.message,1)}}
+async function refresh(){
+ const s=await api('status'); show('gate',0);
+ show('login',!s.logged_in); show('dash',s.logged_in);
+ $('st').textContent=s.running?'🟢 Running':'⚪ Stopped';
+ if(s.target) $('target').value=s.target;
+}
+async function sendCode(){try{say((await api('send_code',{phone:$('phone').value})).msg);show('s1',0);show('s2',1)}catch(e){say(e.message,1)}}
+async function verify(){try{const r=await api('verify',{code:$('code').value});
+ if(r.need_password){show('s2',0);show('s3',1);say('2-step password daalo')}else{say('Login ho gaya ✅');refresh()}}catch(e){say(e.message,1)}}
+async function pwd(){try{await api('password',{password:$('pw').value});say('Login ho gaya ✅');refresh()}catch(e){say(e.message,1)}}
+async function saveTarget(){try{await api('target',{target:$('target').value});say('Target saved ✅')}catch(e){say(e.message,1)}}
+async function act(a){try{await api(a,{});say({start:'VC join ✅',stop:'VC left 🔴',logout:'Logout ho gaya'}[a]);refresh()}catch(e){say(e.message,1)}}
+async function getSession(){try{const s=(await api('session')).session;
+ try{await navigator.clipboard.writeText(s);say('Session copy ho gaya ✅ (SESSION_STRING env me daalo)')}
+ catch(_){prompt('Session string copy karo:',s)}}catch(e){say(e.message,1)}}
+if(P) enter();
+</script></body></html>
