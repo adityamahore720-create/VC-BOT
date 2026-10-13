@@ -3,7 +3,10 @@
 Env: API_ID, API_HASH, BOT_TOKEN, OWNER_ID, PORT (host deta hai)
 Optional: SESSION_STRING, TARGET_ID, AUTO_START (default 1)
 """
-import asyncio, json, os, re, wave
+import asyncio, json, logging, os, re, sys, wave
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)      # Pyrogram isi loop par chalega (important fix)
 from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.errors import (SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
@@ -19,6 +22,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
 DB, SIL, BG = "data.json", "silence.wav", "bg.jpg"
+
+_missing = [k for k, v in {"API_ID": API_ID, "API_HASH": API_HASH,
+            "BOT_TOKEN": BOT_TOKEN, "OWNER_ID": OWNER_ID}.items() if not v]
+if _missing:
+    print("❌ Ye env vars missing hain:", ", ".join(_missing)); sys.exit(1)
 
 data = json.load(open(DB)) if os.path.exists(DB) else {"session": None, "target": None, "running": False}
 def save(): json.dump(data, open(DB, "w"))
@@ -203,11 +211,21 @@ async def main():
                     web.get("/health", lambda r: web.Response(text="ok"))])
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    await bot.start()
+    try:
+        await bot.start()
+    except Exception as e:
+        print("❌ Bot start fail (BOT_TOKEN/API_ID/API_HASH check karo):", repr(e)); raise
+    me = await bot.get_me()
+    print(f"✅ Bot online: @{me.username}")
+    try:
+        sent = await bot.send_photo(OWNER_ID, BG, caption=caption(), reply_markup=home_kb())
+        st["panel"] = (sent.chat.id, sent.id)
+    except Exception as e:
+        print("Owner ko panel nahi bheja (bot me pehle /start dabao, OWNER_ID check karo):", repr(e))
     if data["session"] and data["target"] and data["running"]:
         try: await join()
         except Exception as e: print("auto-join fail:", e)
     print("Bot ready")
     await asyncio.Event().wait()
 
-asyncio.run(main())
+loop.run_until_complete(main())
