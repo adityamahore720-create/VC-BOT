@@ -1,58 +1,59 @@
 """
-24/7 VC Panel - web UI (OTP + 2FA password login) + VC control
-Env vars: API_ID, API_HASH, PANEL_PASS, PORT (host deta hai)
-Optional (restart ke baad bhi login bacha rahe):
-  SESSION_STRING, TARGET_ID, AUTO_START (default 1; band karna ho to 0)
+24/7 VC Userbot - Telegram bot panel (photo + buttons + OTP login)
+Env: API_ID, API_HASH, BOT_TOKEN, OWNER_ID, PORT (host deta hai)
+Optional: SESSION_STRING, TARGET_ID, AUTO_START (default 1)
 """
-import asyncio, json, os, wave
+import asyncio, json, os, re, wave
 from aiohttp import web
-from pyrogram import Client
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+from pyrogram import Client, filters
+from pyrogram.errors import (SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
+                             PasswordHashInvalid, PhoneNumberInvalid, FloodWait)
+from pyrogram.types import InlineKeyboardMarkup as KB, InlineKeyboardButton as B
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as tgf
 from pytgcalls.types import MediaStream
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-PANEL_PASS = os.getenv("PANEL_PASS", "admin123")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
-DB, SIL = "data.json", "silence.wav"
+DB, SIL, BG = "data.json", "silence.wav", "bg.jpg"
 
 data = json.load(open(DB)) if os.path.exists(DB) else {"session": None, "target": None, "running": False}
-save = lambda: json.dump(data, open(DB, "w"))
+def save(): json.dump(data, open(DB, "w"))
 
-# Env vars se settings (Render free par file mit jati hai, isliye)
 if os.getenv("SESSION_STRING"): data["session"] = os.getenv("SESSION_STRING").strip()
 if os.getenv("TARGET_ID"):      data["target"] = os.getenv("TARGET_ID").strip()
 if os.getenv("SESSION_STRING") and os.getenv("TARGET_ID") and os.getenv("AUTO_START", "1") != "0":
     data["running"] = True
 
-login = {"client": None, "phone": None, "hash": None}
+bot = Client("controller", API_ID, API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 user = call = None
+st = {"mode": None, "panel": None}      # mode: phone / code / pass / target
+lg = {"client": None, "phone": None, "hash": None}
 
+# ---------------- VC ----------------
 def make_silence():
     if not os.path.exists(SIL):
         with wave.open(SIL, "wb") as w:
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
-            w.writeframes(b"\x00\x00" * 16000 * 60)   # 60 sec silence (loop hota hai)
-
-async def start_user():
-    global user, call
-    if user: return
-    user = Client("vc_user", API_ID, API_HASH, session_string=data["session"], in_memory=True)
-    call = PyTgCalls(user)
-
-    @call.on_update(tgf.stream_end())
-    async def _loop(_, u):
-        await call.play(u.chat_id, MediaStream(SIL, video_flags=MediaStream.Flags.IGNORE))
-
-    await call.start()
+            w.writeframes(b"\x00\x00" * 16000 * 60)
 
 async def join():
-    if not (data["session"] and data["target"]):
-        raise web.HTTPBadRequest(text="Pehle login karo aur target set karo")
+    global user, call
+    if not data["session"]: raise Exception("Pehle account login karo")
+    if not data["target"]:  raise Exception("Pehle target ID set karo")
     make_silence()
-    await start_user()
+    if user is None:
+        user = Client("vc_user", API_ID, API_HASH, session_string=data["session"], in_memory=True)
+        call = PyTgCalls(user)
+
+        @call.on_update(tgf.stream_end())
+        async def _loop(_, u):
+            await call.play(u.chat_id, MediaStream(SIL, video_flags=MediaStream.Flags.IGNORE))
+
+        await call.start()
     tid = int(data["target"])
     try: await user.get_chat(tid)
     except Exception: pass
@@ -65,95 +66,148 @@ async def leave():
         except Exception: pass
     data["running"] = False; save()
 
-# ---------- web ----------
-def auth(request):
-    if request.headers.get("X-Pass") != PANEL_PASS:
-        raise web.HTTPUnauthorized(text="Wrong panel password")
-
-def ok(**kw): return web.json_response({"ok": True, **kw})
-
-async def index(_):  return web.FileResponse("index.html")
-async def bg(_):     return web.FileResponse("bg.jpg")
-
-async def status(r):
-    auth(r)
-    return ok(logged_in=bool(data["session"]), target=data["target"], running=data["running"])
-
-async def send_code(r):
-    auth(r)
-    phone = (await r.json())["phone"].strip()
-    c = Client("login", API_ID, API_HASH, in_memory=True)
-    await c.connect()
-    sent = await c.send_code(phone)
-    login.update(client=c, phone=phone, hash=sent.phone_code_hash)
-    return ok(msg="OTP bhej diya (Telegram app check karo)")
-
-async def verify(r):
-    auth(r)
-    code = (await r.json())["code"].strip().replace(" ", "")
-    c = login["client"]
-    if not c: raise web.HTTPBadRequest(text="Pehle OTP mangao")
-    try:
-        await c.sign_in(login["phone"], login["hash"], code)
-    except SessionPasswordNeeded:
-        return ok(need_password=True)
-    except (PhoneCodeInvalid, PhoneCodeExpired) as e:
-        raise web.HTTPBadRequest(text="OTP galat ya expire ho gaya")
-    await finish_login()
-    return ok(need_password=False)
-
-async def password(r):
-    auth(r)
-    pw = (await r.json())["password"]
-    try: await login["client"].check_password(pw)
-    except Exception: raise web.HTTPBadRequest(text="Password galat hai")
-    await finish_login()
-    return ok()
-
-async def finish_login():
-    data["session"] = await login["client"].export_session_string()
-    await login["client"].disconnect()
-    login.update(client=None, phone=None, hash=None)
-    save()
-
-async def set_target(r):
-    auth(r)
-    data["target"] = str((await r.json())["target"]).strip(); save()
-    return ok()
-
-async def get_session(r):
-    auth(r)
-    if not data["session"]: raise web.HTTPBadRequest(text="Login nahi hai")
-    return ok(session=data["session"])
-
-async def health(_): return web.Response(text="ok")
-
-async def start(r):  auth(r); await join();  return ok()
-async def stop(r):   auth(r); await leave(); return ok()
-
-async def logout(r):
+async def full_logout():
     global user, call
-    auth(r); await leave()
+    await leave()
     if user:
         try: await user.stop()
         except Exception: pass
     user = call = None
     data.update(session=None, running=False); save()
-    return ok()
 
-async def on_start(app):
+# ---------------- UI ----------------
+def caption(extra=""):
+    acc = "✅ Connected" if data["session"] else "❌ Not logged in"
+    run = "🟢 Running" if data["running"] else "🔴 Stopped"
+    t = (f"🎙 **24/7 VC Panel**\n\n👤 Account: {acc}\n"
+         f"🎯 Target: `{data['target'] or 'Not set'}`\n📡 Status: {run}")
+    return t + (f"\n\n{extra}" if extra else "")
+
+def home_kb():
+    rows = [[B("🚪 Logout Account", callback_data="logout") if data["session"]
+             else B("🔑 Login Account", callback_data="login")],
+            [B("🎯 Set Target", callback_data="target")],
+            [B("🟢 Start VC", callback_data="start"), B("🔴 Stop VC", callback_data="stop")]]
+    if data["session"]: rows.append([B("📋 Session String", callback_data="sess")])
+    rows.append([B("🔄 Refresh", callback_data="home")])
+    return KB(rows)
+
+back_kb = KB([[B("⬅️ Back", callback_data="home")]])
+
+async def setcap(text, kb):
+    if not st["panel"]: return
+    cid, mid = st["panel"]
+    try: await bot.edit_message_caption(cid, mid, text, reply_markup=kb)
+    except Exception: pass
+
+async def home(extra=""):
+    st["mode"] = None
+    await setcap(caption(extra), home_kb())
+
+async def cancel_login():
+    if lg["client"]:
+        try: await lg["client"].disconnect()
+        except Exception: pass
+    lg.update(client=None, phone=None, hash=None)
+
+owner = filters.user(OWNER_ID)
+
+@bot.on_message(filters.command("start") & filters.private & owner)
+async def start_cmd(_, m):
+    sent = await m.reply_photo(BG, caption=caption(), reply_markup=home_kb())
+    st["panel"] = (sent.chat.id, sent.id); st["mode"] = None
+
+@bot.on_message(filters.command("start") & filters.private & ~owner)
+async def deny(_, m):
+    await m.reply(f"⛔ Ye private bot hai.\nTumhari ID: `{m.from_user.id}`")
+
+@bot.on_callback_query(owner)
+async def on_cb(_, q):
+    d = q.data
+    st["panel"] = (q.message.chat.id, q.message.id)
+    if d == "home":
+        await cancel_login(); await home(); await q.answer()
+    elif d == "login":
+        st["mode"] = "phone"
+        await setcap(caption("📱 Apna phone number bhejo\n(country code ke saath, jaise `+919999999999`)"), back_kb)
+        await q.answer()
+    elif d == "target":
+        st["mode"] = "target"
+        await setcap(caption("🎯 Group/Channel ID bhejo\n(jaise `-1001234567890`)"), back_kb)
+        await q.answer()
+    elif d == "start":
+        try: await join(); await q.answer("VC join ho gaya ✅", show_alert=True)
+        except Exception as e: await q.answer(f"Error: {e}"[:190], show_alert=True)
+        await home()
+    elif d == "stop":
+        await leave(); await q.answer("VC chhod diya 🔴", show_alert=True); await home()
+    elif d == "logout":
+        await full_logout(); await q.answer("Logout ho gaya", show_alert=True); await home()
+    elif d == "sess":
+        s = await bot.send_message(q.message.chat.id,
+            f"🔐 Session String (kisi ko mat dena, Render ke `SESSION_STRING` me daalo, phir ye message delete kar do):\n\n`{data['session']}`")
+        await q.answer()
+
+async def finish_login():
+    data["session"] = await lg["client"].export_session_string()
+    await cancel_login(); save()
+
+@bot.on_message(filters.private & owner & filters.text & ~filters.command(["start"]))
+async def on_text(_, m):
+    mode, txt = st["mode"], m.text.strip()
+    if not mode: return
+    try: await m.delete()          # phone/password chat me na dikhe
+    except Exception: pass
+    try:
+        if mode == "phone":
+            await cancel_login()
+            c = Client("login", API_ID, API_HASH, in_memory=True)
+            await c.connect()
+            sent = await c.send_code(txt)
+            lg.update(client=c, phone=txt, hash=sent.phone_code_hash); st["mode"] = "code"
+            await setcap(caption("📨 Telegram app me OTP aaya hoga.\n\n⚠️ OTP **spaces ke saath** bhejo, jaise `1 2 3 4 5` "
+                                 "(warna Telegram code block kar deta hai)."), back_kb)
+        elif mode == "code":
+            code = re.sub(r"\D", "", txt)
+            try:
+                await lg["client"].sign_in(lg["phone"], lg["hash"], code)
+            except SessionPasswordNeeded:
+                st["mode"] = "pass"
+                await setcap(caption("🔐 2-step verification password bhejo."), back_kb); return
+            await finish_login(); await home("✅ Login ho gaya! Ab 🎯 target set karo.")
+        elif mode == "pass":
+            await lg["client"].check_password(txt)
+            await finish_login(); await home("✅ Login ho gaya! Ab 🎯 target set karo.")
+        elif mode == "target":
+            int(txt)                 # check valid number
+            data["target"] = txt; save()
+            await home("✅ Target save ho gaya.")
+    except PhoneNumberInvalid:
+        await setcap(caption("❌ Number galat hai. Dobara bhejo (+91...)."), back_kb)
+    except (PhoneCodeInvalid, PhoneCodeExpired):
+        await setcap(caption("❌ OTP galat/expire. Back dabake dobara login karo, OTP spaces ke saath bhejo."), back_kb)
+        await cancel_login(); st["mode"] = None
+    except PasswordHashInvalid:
+        await setcap(caption("❌ Password galat. Dobara bhejo."), back_kb)
+    except ValueError:
+        await setcap(caption("❌ ID number honi chahiye, jaise `-1001234567890`."), back_kb)
+    except FloodWait as e:
+        await setcap(caption(f"⏳ Telegram ne {e.value}s rukne ko kaha. Baad me try karo."), back_kb)
+    except Exception as e:
+        await setcap(caption(f"❌ Error: {e}"[:900]), back_kb)
+
+# ---------------- main ----------------
+async def main():
+    app = web.Application()
+    app.add_routes([web.get("/", lambda r: web.Response(text="VC bot running")),
+                    web.get("/health", lambda r: web.Response(text="ok"))])
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    await bot.start()
     if data["session"] and data["target"] and data["running"]:
         try: await join()
         except Exception as e: print("auto-join fail:", e)
+    print("Bot ready")
+    await asyncio.Event().wait()
 
-app = web.Application()
-app.on_startup.append(on_start)
-app.add_routes([
-    web.get("/", index), web.get("/bg.jpg", bg),
-    web.get("/health", health), web.get("/api/session", get_session),
-    web.get("/api/status", status),
-    web.post("/api/send_code", send_code), web.post("/api/verify", verify),
-    web.post("/api/password", password), web.post("/api/target", set_target),
-    web.post("/api/start", start), web.post("/api/stop", stop), web.post("/api/logout", logout),
-])
-web.run_app(app, host="0.0.0.0", port=PORT)
+asyncio.run(main())
