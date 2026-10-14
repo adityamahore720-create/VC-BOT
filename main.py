@@ -3,7 +3,7 @@
 Env: API_ID, API_HASH, BOT_TOKEN, OWNER_ID, PORT (host deta hai)
 Optional: SESSION_STRING, TARGET_ID, AUTO_START (default 1)
 """
-import asyncio, json, logging, os, re, sys, time, wave
+import asyncio, json, logging, os, re, resource, sys, time, wave
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)      # Pyrogram isi loop par chalega (important)
@@ -111,9 +111,14 @@ async def full_logout():
 
 async def watcher():
     """Har 10s check: VC start hote hi auto-join. Join ke baad 2 min me ek baar health check."""
-    last = 0
+    last = beat = 0
     while True:
         await asyncio.sleep(10)
+        if time.time() - beat > 300:       # har 5 min: zinda hu + memory (OOM check ke liye)
+            beat = time.time()
+            mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+            logging.info("HEARTBEAT alive | joined=%s running=%s | peak_mem=%sMB",
+                         flags["joined"], data["running"], mb)
         try:
             if not (data["running"] and data["session"] and data["target"]): continue
             gap = 120 if flags["joined"] else 10
