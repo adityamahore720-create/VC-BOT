@@ -77,8 +77,8 @@ def home_kb():
     return kb([
         [ib("📗 ABOUT", "about"), ib("💌 OWNER", url=OWNER_URL)],
         [ib("💡 GUIDE", "guide", style="success")],
-        [ib("⌜ LOGIN ⌟", "login", style="primary"), ib("⌜ ACCOUNTS ⌟", "accounts", style="success")],
-        [ib("🎯 TARGETS", "targets", style="primary"), ib("📊 STATUS", "status")],
+        [ib("⌜ ACCOUNTS ⌟", "accounts", style="primary"), ib("🎯 TARGETS", "targets", style="success")],
+        [ib("📊 STATUS", "status")],
         [ib("⌜ HELP ⌟", url=HELP_URL), ib("⌜ UPDATES ⌟", url=UPDATES_URL, style="success")],
     ])
 
@@ -102,12 +102,23 @@ async def del_msg(m):
     try: await m.delete()
     except Exception: pass
 
+def _old(key):
+    v = get_set(key)
+    if v:
+        try:
+            c, i = v.split(":"); return int(c), int(i)
+        except Exception: return None
+
+async def _kill(ids):
+    for t in ids:
+        if t:
+            try: await bot.delete_message(*t)
+            except Exception: pass
+
 async def send_home(chat_id):
-    old = dict(UI); UI.clear()
-    try:                                     # bottom keyboard set karo, phir carrier msg hata do
-        p = await bot.send_message(chat_id, "🎬", reply_markup=menu_kb()); await p.delete()
-    except Exception as e:
-        logging.warning("keyboard: %s", e)
+    old = [_old("home_msg"), _old("panel_msg")]; UI.clear()
+    # keyboard wala msg delete nahi karna, warna SET VIDEO button gayab ho jata hai
+    panel = await bot.send_message(chat_id, fx("🎛 Control panel · SET VIDEO below"), reply_markup=menu_kb())
     vid = get_set("video") or START_VIDEO
     home = None
     if vid:
@@ -118,9 +129,8 @@ async def send_home(chat_id):
     if not home:
         home = await bot.send_message(chat_id, fx(HOME_TXT), reply_markup=home_kb())
     set_ui(home)
-    if old:
-        try: await bot.delete_message(old["chat"], old["id"])
-        except Exception: pass
+    put_set("home_msg", f"{chat_id}:{home.message_id}"); put_set("panel_msg", f"{chat_id}:{panel.message_id}")
+    await _kill(old)
 
 async def show(text, markup=None):
     if not UI: return
@@ -135,22 +145,38 @@ async def show(text, markup=None):
         logging.warning("edit fail: %s", e)
         await send_home(UI["chat"])
 
-# ---------------- VC workers ----------------
-def prep_media():
-    if not shutil.which("ffmpeg"):
-        try:
+# ---------------- media (ffmpeg + silent wav) ----------------
+MEDIA_READY = asyncio.Event()
+
+def _make_wav():
+    if os.path.exists(SILENCE): return
+    with wave.open(SILENCE, "wb") as w:          # 10 min silent wav, 8kHz mono
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+        sec = b"\x00\x00" * 8000
+        for _ in range(600): w.writeframes(sec)
+
+async def prep_media():
+    try:
+        _make_wav()
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            try:
+                import static_ffmpeg
+                await asyncio.to_thread(static_ffmpeg.add_paths)     # ffmpeg + ffprobe
+            except Exception as e:
+                logging.warning("static-ffmpeg: %s", e)
+        if not shutil.which("ffmpeg"):
             import imageio_ffmpeg
             d = os.path.join(tempfile.gettempdir(), "ffbin"); os.makedirs(d, exist_ok=True)
             link = os.path.join(d, "ffmpeg")
             if not os.path.exists(link): os.symlink(imageio_ffmpeg.get_ffmpeg_exe(), link)
             os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
-        except Exception as e:
-            logging.warning("ffmpeg setup: %s", e)
-    if not os.path.exists(SILENCE):          # 10s silent wav (ffmpeg ki zaroorat nahi)
-        with wave.open(SILENCE, "wb") as w:
-            w.setnchannels(1); w.setsampwidth(2); w.setframerate(48000)
-            w.writeframes(b"\x00\x00" * 48000 * 10)
+    except Exception as e:
+        logging.warning("media prep: %s", e)
+    finally:
+        logging.info("ffmpeg=%s ffprobe=%s", shutil.which("ffmpeg"), shutil.which("ffprobe"))
+        MEDIA_READY.set()
 
+# ---------------- VC workers ----------------
 class Worker:
     def __init__(self, acc_id, session):
         self.id = acc_id
@@ -159,6 +185,7 @@ class Worker:
         self.call = PyTgCalls(self.app)
         self.targets: set[int] = set()
         self.state: dict[int, str] = {}
+        self.err: dict[int, str] = {}
         self.task = None
 
     async def start(self):
@@ -176,20 +203,27 @@ class Worker:
         return (await self.app.get_chat(key)).id
 
     async def join(self, chat_id):
-        await self.call.play(chat_id, MediaStream(
-            SILENCE, AudioQuality.LOW, video_flags=MediaStream.Flags.IGNORE,
-            ffmpeg_parameters="-stream_loop -1"))
+        await asyncio.wait_for(MEDIA_READY.wait(), 180)
+        try:
+            ms = MediaStream(SILENCE, AudioQuality.LOW, video_flags=MediaStream.Flags.IGNORE,
+                             audio_flags=MediaStream.Flags.REQUIRED)
+        except TypeError:
+            ms = MediaStream(SILENCE, AudioQuality.LOW, video_flags=MediaStream.Flags.IGNORE)
+        await self.call.play(chat_id, ms)
 
     async def tick(self, chat_id):
         try:
-            await self.call.played_time(chat_id); self.state[chat_id] = "in"
+            await self.call.played_time(chat_id)
+            self.state[chat_id] = "in"; self.err.pop(chat_id, None); return
         except Exception:
-            try:
-                await self.join(chat_id); self.state[chat_id] = "in"
-                logging.info("[acc %s] joined VC %s", self.id, chat_id)
-            except Exception as e:
-                self.state[chat_id] = "wait"
-                logging.info("[acc %s] VC %s off: %s", self.id, chat_id, e)
+            pass
+        try:
+            await self.join(chat_id)
+            self.state[chat_id] = "in"; self.err.pop(chat_id, None)
+            logging.info("[acc %s] joined VC %s", self.id, chat_id)
+        except Exception as e:
+            self.state[chat_id] = "wait"; self.err[chat_id] = f"{type(e).__name__}: {e}"
+            logging.warning("[acc %s] VC %s join fail: %r", self.id, chat_id, e)
 
     async def keeper(self):
         while True:
@@ -262,14 +296,36 @@ async def about(c: CallbackQuery):
 
 @router.callback_query(F.data == "guide")
 async def guide(c: CallbackQuery):
-    await c.answer(fx("1) LOGIN: number + OTP\n2) TARGETS: group/channel add karo\n"
+    await c.answer(fx("1) ACCOUNTS: add account (number + OTP)\n2) TARGETS: group/channel add karo\n"
                       "3) Account us chat ka member ho\nVC start hote hi account join ho jayega."), show_alert=True)
 
-# ---- LOGIN ----
+# ---- ACCOUNTS (add / list / remove — sab ek jagah) ----
+async def screen_accounts(note=""):
+    rows = db.execute("SELECT id,name,phone FROM accounts").fetchall()
+    txt = "👤 <b>Accounts</b>\n\n" + (note + "\n\n" if note else "")
+    txt += ("\n".join(f"{'🟢' if i in workers else '🔴'} <b>#{i}</b> {esc(n)} · <code>{esc(p)}</code>" for i, n, p in rows)
+            if rows else "Koi account nahi hai. ➕ ADD ACCOUNT dabao.")
+    k = [[ib("➕ ADD ACCOUNT", "login", style="primary")]]
+    k += [[ib(f"🚪 REMOVE #{i} {n}"[:40], f"lo:{i}", style="danger")] for i, n, _ in rows]
+    await show(txt, kb(k + [[ib("⬅️ BACK", "home", style="danger")]]))
+
+@router.callback_query(F.data == "accounts")
+async def accounts(c: CallbackQuery, state: FSMContext):
+    set_ui(c.message); await state.clear(); await cancel_login(c.from_user.id)
+    await c.answer(); await screen_accounts()
+
+@router.callback_query(F.data.startswith("lo:"))
+async def logout(c: CallbackQuery):
+    set_ui(c.message); aid = int(c.data.split(":")[1]); w = workers.pop(aid, None)
+    if w: await w.stop()
+    db.execute("DELETE FROM accounts WHERE id=?", (aid,)); db.execute("DELETE FROM targets WHERE account_id=?", (aid,)); db.commit()
+    await c.answer(fx("✅ Account hata diya")); await screen_accounts()
+
+# ---- ADD ACCOUNT (login flow) ----
 @router.callback_query(F.data == "login")
 async def login(c: CallbackQuery, state: FSMContext):
     set_ui(c.message); await c.answer(); await state.set_state(Login.phone)
-    await show("📱 <b>Login</b>\n\nPhone number bhejo (country code ke saath)\n<code>+919999999999</code>", back_kb())
+    await show("📱 <b>Add account</b>\n\nPhone number bhejo (country code ke saath)\n<code>+919999999999</code>", back_kb("accounts"))
 
 @router.message(Login.phone)
 async def l_phone(m: Message, state: FSMContext):
@@ -283,10 +339,10 @@ async def l_phone(m: Message, state: FSMContext):
     except Exception as e:
         try: await cl.disconnect()
         except Exception: pass
-        return await show(f"❌ <code>{esc(e)}</code>\n\nDobara number bhejo.", back_kb())
+        return await show(f"❌ <code>{esc(e)}</code>\n\nDobara number bhejo.", back_kb("accounts"))
     temp[m.from_user.id] = {"cl": cl, "phone": phone, "hash": sent.phone_code_hash}
     await state.set_state(Login.code)
-    await show("🔑 <b>OTP</b>\n\nCode <b>spaces ke saath</b> bhejo\n<code>1 2 3 4 5</code>", back_kb())
+    await show("🔑 <b>OTP</b>\n\nCode <b>spaces ke saath</b> bhejo\n<code>1 2 3 4 5</code>", back_kb("accounts"))
 
 @router.message(Login.code)
 async def l_code(m: Message, state: FSMContext):
@@ -296,11 +352,11 @@ async def l_code(m: Message, state: FSMContext):
         await d["cl"].sign_in(d["phone"], d["hash"], m.text.replace(" ", ""))
     except SessionPasswordNeeded:
         await state.set_state(Login.pw)
-        return await show("🔐 <b>2-Step password</b>\n\nPassword bhejo.", back_kb())
+        return await show("🔐 <b>2-Step password</b>\n\nPassword bhejo.", back_kb("accounts"))
     except (PhoneCodeInvalid, PhoneCodeExpired) as e:
-        return await show(f"❌ <code>{esc(e)}</code>\n\nDobara OTP bhejo.", back_kb())
+        return await show(f"❌ <code>{esc(e)}</code>\n\nDobara OTP bhejo.", back_kb("accounts"))
     except Exception as e:
-        return await show(f"❌ <code>{esc(e)}</code>", back_kb())
+        return await show(f"❌ <code>{esc(e)}</code>", back_kb("accounts"))
     await finish_login(m, state)
 
 @router.message(Login.pw)
@@ -308,8 +364,8 @@ async def l_pw(m: Message, state: FSMContext):
     await del_msg(m); d = temp.get(m.from_user.id)
     if not d or not m.text: return
     try: await d["cl"].check_password(m.text)
-    except PasswordHashInvalid: return await show("❌ Password galat hai, dobara bhejo.", back_kb())
-    except Exception as e: return await show(f"❌ <code>{esc(e)}</code>", back_kb())
+    except PasswordHashInvalid: return await show("❌ Password galat hai, dobara bhejo.", back_kb("accounts"))
+    except Exception as e: return await show(f"❌ <code>{esc(e)}</code>", back_kb("accounts"))
     await finish_login(m, state)
 
 async def finish_login(m: Message, state: FSMContext):
@@ -327,27 +383,8 @@ async def finish_login(m: Message, state: FSMContext):
                             (d["phone"], me.first_name, session)).lastrowid
     db.commit(); await state.clear()
     w = await start_worker(acc_id, session)
-    if w: await show(f"✅ <b>{esc(me.first_name)}</b> login ho gaya.", back_kb())
-    else: await show(f"⚠️ Login hua par worker start nahi hua:\n<code>{esc(errors.get(acc_id))}</code>", back_kb())
-
-# ---- ACCOUNTS ----
-async def screen_accounts():
-    rows = db.execute("SELECT id,name,phone FROM accounts").fetchall()
-    txt = "👤 <b>Accounts</b>\n\n" + ("\n".join(f"<b>#{i}</b> {esc(n)} · <code>{esc(p)}</code>" for i, n, p in rows)
-                                    if rows else "Koi account login nahi hai.")
-    k = [[ib(f"🚪 LOGOUT #{i}", f"lo:{i}", style="danger")] for i, _, _ in rows]
-    await show(txt, kb(k + [[ib("⬅️ BACK", "home", style="danger")]]))
-
-@router.callback_query(F.data == "accounts")
-async def accounts(c: CallbackQuery, state: FSMContext):
-    set_ui(c.message); await state.clear(); await c.answer(); await screen_accounts()
-
-@router.callback_query(F.data.startswith("lo:"))
-async def logout(c: CallbackQuery):
-    set_ui(c.message); aid = int(c.data.split(":")[1]); w = workers.pop(aid, None)
-    if w: await w.stop()
-    db.execute("DELETE FROM accounts WHERE id=?", (aid,)); db.execute("DELETE FROM targets WHERE account_id=?", (aid,)); db.commit()
-    await c.answer(fx("✅ Account hata diya")); await screen_accounts()
+    if w: await screen_accounts(f"✅ <b>{esc(me.first_name)}</b> login ho gaya.")
+    else: await screen_accounts(f"⚠️ Login hua par worker start nahi hua:\n<code>{esc(errors.get(acc_id))[:200]}</code>")
 
 # ---- TARGETS ----
 async def screen_targets(note=""):
@@ -373,7 +410,7 @@ async def rm_target(c: CallbackQuery):
     set_ui(c.message); _, aid, chat = c.data.split(":"); aid = int(aid); cid = int(chat)
     w = workers.get(aid)
     if w:
-        w.targets.discard(cid); w.state.pop(cid, None)
+        w.targets.discard(cid); w.state.pop(cid, None); w.err.pop(cid, None)
         try: await w.call.leave_call(cid)
         except Exception: pass
     db.execute("DELETE FROM targets WHERE account_id=? AND chat=?", (aid, chat)); db.commit()
@@ -387,7 +424,7 @@ async def ask_chat(state: FSMContext, acc):
 async def add_target(c: CallbackQuery, state: FSMContext):
     set_ui(c.message)
     accs = db.execute("SELECT id,name FROM accounts").fetchall()
-    if not accs: return await c.answer(fx("⚠️ Pehle LOGIN karo."), show_alert=True)
+    if not accs: return await c.answer(fx("⚠️ Pehle ACCOUNTS me account add karo."), show_alert=True)
     await c.answer()
     if len(accs) == 1: return await ask_chat(state, accs[0][0])
     rows = [[ib(f"#{i} {n}"[:40], f"st:{i}", style="primary")] for i, n in accs] + [[ib("⬅️ BACK", "targets", style="danger")]]
@@ -405,37 +442,54 @@ async def t_chat(m: Message, state: FSMContext):
     await show("⏳ <b>Please wait…</b>")
     w = await get_worker(acc)
     if not w:
-        return await show(f"❌ Account start nahi hua:\n<code>{esc(errors.get(acc, 'unknown'))}</code>", back_kb("targets"))
+        return await show(f"❌ Account start nahi hua:\n<code>{esc(errors.get(acc, 'unknown'))[:300]}</code>", back_kb("targets"))
     try: cid = await w.resolve(m.text)
     except Exception as e:
         return await show(f"❌ Chat nahi mila. Account us chat ka member hona chahiye.\n<code>{esc(e)}</code>\n\nDobara ID bhejo.", back_kb("targets"))
     db.execute("INSERT OR REPLACE INTO targets VALUES(?,?)", (acc, str(cid))); db.commit()
-    w.targets.add(cid); await state.clear(); asyncio.create_task(w.tick(cid))
-    await screen_targets(f"✅ Target set: <code>{cid}</code>")
+    w.targets.add(cid); await state.clear()
+    await show("⏳ <b>VC join try ho raha hai…</b>")
+    await w.tick(cid)
+    if w.state.get(cid) == "in": await screen_targets(f"✅ Target set · 🎧 VC me join ho gaya: <code>{cid}</code>")
+    else: await screen_targets(f"✅ Target set: <code>{cid}</code>\n⏳ Abhi join nahi hua:\n<code>{esc(w.err.get(cid, ''))[:200]}</code>")
 
 # ---- STATUS ----
-@router.callback_query(F.data == "status")
-async def status(c: CallbackQuery, state: FSMContext):
-    set_ui(c.message); await state.clear(); await c.answer()
+async def screen_status():
     rows = db.execute("SELECT id,name FROM accounts").fetchall()
-    txt = "📊 <b>Live status</b>\n\n" if rows else "📊 <b>Live status</b>\n\nKoi account nahi hai."
+    txt = "📊 <b>Live status</b>\n\n" + ("" if rows else "Koi account nahi hai.")
     for i, n in rows:
         w = workers.get(i)
         txt += f"👤 <b>{esc(n)}</b> · {'🟢 online' if w else '🔴 offline'}\n"
         if not w and errors.get(i): txt += f"<code>{esc(errors[i])[:150]}</code>\n"
         for cid in (w.targets if w else []):
-            txt += f"   • <code>{cid}</code> — {'🎧 In VC' if w.state.get(cid) == 'in' else '⏳ Waiting for VC'}\n"
+            ok = w.state.get(cid) == "in"
+            txt += f"   • <code>{cid}</code> — {'🎧 In VC' if ok else '⏳ Waiting for VC'}\n"
+            if not ok and w.err.get(cid): txt += f"     <code>{esc(w.err[cid])[:120]}</code>\n"
         txt += "\n"
-    await show(txt, kb([[ib("🔄 REFRESH", "status", style="primary")], [ib("⬅️ BACK", "home", style="danger")]]))
+    await show(txt, kb([[ib("🎧 JOIN NOW", "joinnow", style="success"), ib("🔄 REFRESH", "status", style="primary")],
+                        [ib("⬅️ BACK", "home", style="danger")]]))
+
+@router.callback_query(F.data == "status")
+async def status(c: CallbackQuery, state: FSMContext):
+    set_ui(c.message); await state.clear(); await c.answer(); await screen_status()
+
+@router.callback_query(F.data == "joinnow")
+async def joinnow(c: CallbackQuery):
+    set_ui(c.message); await c.answer(fx("⏳ Joining…"))
+    await show("⏳ <b>VC join try ho raha hai…</b>")
+    for w in list(workers.values()):
+        for cid in list(w.targets): await w.tick(cid)
+    await screen_status()
 
 # ---- VIDEO (bottom keyboard button) ----
+VID_KB = lambda: kb([[ib("🚫 REMOVE VIDEO", "rmvid", style="danger")], [ib("⬅️ BACK", "home", style="danger")]])
+
 @router.message(F.text == B_VID)
 async def vid_btn(m: Message, state: FSMContext):
     await del_msg(m); await state.clear(); await cancel_login(m.from_user.id)
     if not UI: await send_home(m.chat.id)
     await state.set_state(Vid.wait)
-    await show("🎬 <b>Set video</b>\n\nEk video bhejo. Start par ye <b>hidden (spoiler)</b> dikhega.",
-               kb([[ib("🚫 REMOVE VIDEO", "rmvid", style="danger")], [ib("⬅️ BACK", "home", style="danger")]]))
+    await show("🎬 <b>Set video</b>\n\nEk video bhejo. Start par ye <b>hidden (spoiler)</b> dikhega.", VID_KB())
 
 @router.message(Vid.wait, F.video)
 async def got_video(m: Message, state: FSMContext):
@@ -443,9 +497,7 @@ async def got_video(m: Message, state: FSMContext):
 
 @router.message(Vid.wait)
 async def not_video(m: Message):
-    await del_msg(m)
-    await show("⚠️ <b>Sirf video bhejo.</b>",
-               kb([[ib("🚫 REMOVE VIDEO", "rmvid", style="danger")], [ib("⬅️ BACK", "home", style="danger")]]))
+    await del_msg(m); await show("⚠️ <b>Sirf video bhejo.</b>", VID_KB())
 
 @router.callback_query(F.data == "rmvid")
 async def rm_video(c: CallbackQuery, state: FSMContext):
@@ -459,9 +511,11 @@ async def private(m: Message):
     await m.answer(fx("🔒 This is a private bot."))
 
 async def main():
-    prep_media()
-    for acc_id, session in db.execute("SELECT id,session FROM accounts").fetchall():
-        asyncio.create_task(start_worker(acc_id, session))
+    async def boot():
+        await prep_media()
+        for acc_id, session in db.execute("SELECT id,session FROM accounts").fetchall():
+            asyncio.create_task(start_worker(acc_id, session))
+    asyncio.create_task(boot())
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router); dp.include_router(pub)
     await dp.start_polling(bot, drop_pending_updates=True)
