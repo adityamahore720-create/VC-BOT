@@ -1,4 +1,4 @@
-import asyncio, os, re, shutil, sqlite3, logging, html, wave, tempfile
+import asyncio, os, re, sys, gc, shutil, sqlite3, logging, html, wave, tempfile
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -78,7 +78,7 @@ def home_kb():
         [ib("📗 ABOUT", "about"), ib("💌 OWNER", url=OWNER_URL)],
         [ib("💡 GUIDE", "guide", style="success")],
         [ib("⌜ ACCOUNTS ⌟", "accounts", style="primary"), ib("🎯 TARGETS", "targets", style="success")],
-        [ib("📊 STATUS", "status")],
+        [ib("📊 STATUS", "status"), ib("♻️ REFRESH", "refresh", style="danger")],
         [ib("⌜ HELP ⌟", url=HELP_URL), ib("⌜ UPDATES ⌟", url=UPDATES_URL, style="success")],
     ])
 
@@ -181,7 +181,8 @@ class Worker:
     def __init__(self, acc_id, session):
         self.id = acc_id
         self.app = Client(f"acc{acc_id}", api_id=API_ID, api_hash=API_HASH,
-                          session_string=session, in_memory=True)
+                          session_string=session, in_memory=True,
+                          workers=2, max_concurrent_transmissions=1)
         self.call = PyTgCalls(self.app)
         self.targets: set[int] = set()
         self.state: dict[int, str] = {}
@@ -191,7 +192,7 @@ class Worker:
     async def start(self):
         await self.app.start()
         try:
-            async for _ in self.app.get_dialogs(limit=300): pass
+            async for _ in self.app.get_dialogs(limit=100): pass
         except Exception as e:
             logging.warning("dialogs cache: %s", e)
         await self.call.start()
@@ -228,7 +229,7 @@ class Worker:
     async def keeper(self):
         while True:
             for cid in list(self.targets): await self.tick(cid)
-            await asyncio.sleep(20)
+            await asyncio.sleep(30)
 
     async def stop(self):
         if self.task: self.task.cancel()
@@ -261,6 +262,23 @@ async def get_worker(acc_id):
     if w: return w
     r = db.execute("SELECT session FROM accounts WHERE id=?", (acc_id,)).fetchone()
     return await start_worker(acc_id, r[0]) if r else None
+
+# ---------------- refresh helpers ----------------
+def rss_mb() -> int:
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("VmRSS:"): return int(line.split()[1]) // 1024
+    except Exception: pass
+    return 0
+
+def kill_children():                      # leftover ffmpeg wagairah band karo
+    me = os.getpid()
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            try:
+                with open(f"/proc/{p}/stat") as f: ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+                if ppid == me: os.kill(int(p), 9)
+            except Exception: pass
 
 # ---------------- handlers ----------------
 router = Router()
@@ -504,6 +522,31 @@ async def rm_video(c: CallbackQuery, state: FSMContext):
     set_ui(c.message); del_set("video"); await state.clear(); await c.answer(fx("🚫 Video hata diya"))
     await send_home(c.message.chat.id)
 
+# ---- REFRESH (RAM clear, accounts safe) ----
+@router.callback_query(F.data == "refresh")
+async def refresh(c: CallbackQuery, state: FSMContext):
+    set_ui(c.message); await state.clear(); await cancel_login(c.from_user.id)
+    await c.answer(fx("♻️ Refreshing…"))
+    put_set("refreshing", f"{c.message.chat.id}:{rss_mb()}")
+    await show("♻️ <b>Refreshing…</b>\n\nRAM clear ho rahi hai. Accounts aur targets safe hain, kuch seconds me bot wapas aayega.")
+    for w in list(workers.values()):
+        for cid in list(w.targets):
+            try: await asyncio.wait_for(w.call.leave_call(cid), 5)
+            except Exception: pass
+        try: await asyncio.wait_for(w.stop(), 10)
+        except Exception: pass
+    db.commit(); db.close()
+    kill_children(); gc.collect()
+    os.execv(sys.executable, [sys.executable] + sys.argv)     # fresh process = fresh RAM
+
+async def after_refresh(chat_id: int, before: str):
+    await send_home(chat_id)
+    await asyncio.sleep(45)                                    # workers start hone do
+    m = await bot.send_message(chat_id, fx(f"✅ Bot refreshed · RAM {before} MB → {rss_mb()} MB\nAccounts safe hain."))
+    await asyncio.sleep(10)
+    try: await m.delete()
+    except Exception: pass
+
 # ---- non-owner ----
 pub = Router()
 @pub.message()
@@ -516,6 +559,12 @@ async def main():
         for acc_id, session in db.execute("SELECT id,session FROM accounts").fetchall():
             asyncio.create_task(start_worker(acc_id, session))
     asyncio.create_task(boot())
+    r = get_set("refreshing")
+    if r:
+        del_set("refreshing")
+        try:
+            chat, before = r.split(":"); asyncio.create_task(after_refresh(int(chat), before))
+        except Exception: pass
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router); dp.include_router(pub)
     await dp.start_polling(bot, drop_pending_updates=True)
