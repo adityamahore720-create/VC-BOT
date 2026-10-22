@@ -1,4 +1,4 @@
-pyrofork
+aiogram>=3.25
+pyrogram
 tgcrypto
 py-tgcalls
-aiohttp
