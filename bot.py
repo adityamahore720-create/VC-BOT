@@ -1,4 +1,4 @@
-import asyncio, os, re, sys, gc, shutil, sqlite3, logging, html, wave, tempfile
+import asyncio, os, re, sys, gc, time, shutil, sqlite3, logging, html, wave, tempfile
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -211,6 +211,9 @@ class Worker:
         except TypeError:
             ms = MediaStream(SILENCE, AudioQuality.LOW, video_flags=MediaStream.Flags.IGNORE)
         await self.call.play(chat_id, ms)
+        await asyncio.sleep(1)
+        try: await self.call.mute_stream(chat_id)          # mic OFF
+        except Exception as e: logging.warning("mute fail: %r", e)
 
     async def tick(self, chat_id):
         try:
@@ -270,6 +273,26 @@ def rss_mb() -> int:
             if line.startswith("VmRSS:"): return int(line.split()[1]) // 1024
     except Exception: pass
     return 0
+
+RAM_LIMIT = int(os.getenv("RAM_LIMIT", "400"))   # MB, isse upar auto refresh
+BOOT_TIME = time.time()
+
+def _rss(pid) -> int:
+    try:
+        for line in open(f"/proc/{pid}/status"):
+            if line.startswith("VmRSS:"): return int(line.split()[1]) // 1024
+    except Exception: pass
+    return 0
+
+def total_mb() -> int:                    # bot + uske child processes (ffmpeg) ki RAM
+    me = os.getpid(); t = _rss(me)
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            try:
+                with open(f"/proc/{p}/stat") as f: ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+                if ppid == me: t += _rss(p)
+            except Exception: pass
+    return t
 
 def kill_children():                      # leftover ffmpeg wagairah band karo
     me = os.getpid()
@@ -523,12 +546,8 @@ async def rm_video(c: CallbackQuery, state: FSMContext):
     await send_home(c.message.chat.id)
 
 # ---- REFRESH (RAM clear, accounts safe) ----
-@router.callback_query(F.data == "refresh")
-async def refresh(c: CallbackQuery, state: FSMContext):
-    set_ui(c.message); await state.clear(); await cancel_login(c.from_user.id)
-    await c.answer(fx("♻️ Refreshing…"))
-    put_set("refreshing", f"{c.message.chat.id}:{rss_mb()}")
-    await show("♻️ <b>Refreshing…</b>\n\nRAM clear ho rahi hai. Accounts aur targets safe hain, kuch seconds me bot wapas aayega.")
+async def restart_bot(chat_id: int, auto: bool = False):
+    put_set("refreshing", f"{chat_id}:{total_mb()}:{1 if auto else 0}")
     for w in list(workers.values()):
         for cid in list(w.targets):
             try: await asyncio.wait_for(w.call.leave_call(cid), 5)
@@ -539,10 +558,28 @@ async def refresh(c: CallbackQuery, state: FSMContext):
     kill_children(); gc.collect()
     os.execv(sys.executable, [sys.executable] + sys.argv)     # fresh process = fresh RAM
 
-async def after_refresh(chat_id: int, before: str):
-    await send_home(chat_id)
+@router.callback_query(F.data == "refresh")
+async def refresh(c: CallbackQuery, state: FSMContext):
+    set_ui(c.message); await state.clear(); await cancel_login(c.from_user.id)
+    await c.answer(fx("♻️ Refreshing…"))
+    await show("♻️ <b>Refreshing…</b>\n\nRAM clear ho rahi hai. Accounts aur targets safe hain, kuch seconds me bot wapas aayega.")
+    await restart_bot(c.message.chat.id)
+
+async def ram_watchdog():
+    while True:
+        await asyncio.sleep(60)
+        if time.time() - BOOT_TIME < 180: continue          # boot ke turant baad nahi
+        used = total_mb()
+        if used >= RAM_LIMIT:
+            logging.warning("RAM %s MB >= %s MB, auto refresh", used, RAM_LIMIT)
+            try: await bot.send_message(OWNER_ID, fx(f"♻️ RAM {used} MB ho gayi · auto refresh ho raha hai…"))
+            except Exception: pass
+            await restart_bot(OWNER_ID, auto=True)
+
+async def after_refresh(chat_id: int, before: str, auto: bool):
+    if not auto: await send_home(chat_id)
     await asyncio.sleep(45)                                    # workers start hone do
-    m = await bot.send_message(chat_id, fx(f"✅ Bot refreshed · RAM {before} MB → {rss_mb()} MB\nAccounts safe hain."))
+    m = await bot.send_message(chat_id, fx(f"✅ {'Auto ' if auto else ''}Refresh done · RAM {before} MB → {total_mb()} MB\nAccounts safe hain."))
     await asyncio.sleep(10)
     try: await m.delete()
     except Exception: pass
@@ -563,8 +600,9 @@ async def main():
     if r:
         del_set("refreshing")
         try:
-            chat, before = r.split(":"); asyncio.create_task(after_refresh(int(chat), before))
+            chat, before, auto = r.split(":"); asyncio.create_task(after_refresh(int(chat), before, auto == "1"))
         except Exception: pass
+    asyncio.create_task(ram_watchdog())
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router); dp.include_router(pub)
     await dp.start_polling(bot, drop_pending_updates=True)
