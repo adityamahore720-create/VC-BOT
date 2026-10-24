@@ -9,7 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
                            KeyboardButton, ReplyKeyboardMarkup)
-from pyrogram import Client
+from pyrogram import Client, raw
 from pyrogram.errors import (SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
                              PasswordHashInvalid)
 from pytgcalls import PyTgCalls
@@ -187,6 +187,8 @@ class Worker:
         self.targets: set[int] = set()
         self.state: dict[int, str] = {}
         self.err: dict[int, str] = {}
+        self.muted: dict[int, bool] = {}
+        self.mute_err: dict[int, str] = {}
         self.task = None
 
     async def start(self):
@@ -211,14 +213,42 @@ class Worker:
         except TypeError:
             ms = MediaStream(SILENCE, AudioQuality.LOW, video_flags=MediaStream.Flags.IGNORE)
         await self.call.play(chat_id, ms)
-        await asyncio.sleep(1)
-        try: await self.call.mute_stream(chat_id)          # mic OFF
-        except Exception as e: logging.warning("mute fail: %r", e)
+        self.muted[chat_id] = False
+        await asyncio.sleep(2)
+        await self.mute(chat_id)
+
+    async def force_mute(self, chat_id):
+        """Telegram server par seedha self-mute (mic icon off)."""
+        peer = await self.app.resolve_peer(chat_id)
+        if isinstance(peer, raw.types.InputPeerChannel):
+            full = await self.app.invoke(raw.functions.channels.GetFullChannel(
+                channel=raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)))
+        else:
+            full = await self.app.invoke(raw.functions.messages.GetFullChat(chat_id=peer.chat_id))
+        call = full.full_chat.call
+        if not call: raise RuntimeError("no active call")
+        me = await self.app.resolve_peer("me")
+        await self.app.invoke(raw.functions.phone.EditGroupCallParticipant(call=call, participant=me, muted=True))
+
+    async def mute(self, chat_id):
+        ok, errs = False, []
+        try:
+            await self.call.mute_stream(chat_id); ok = True
+        except Exception as e:
+            errs.append(f"mute_stream {type(e).__name__}")
+        try:
+            await self.force_mute(chat_id); ok = True
+        except Exception as e:
+            errs.append(f"raw {type(e).__name__}: {e}")
+        self.muted[chat_id] = ok; self.mute_err[chat_id] = " | ".join(errs) if not ok else ""
+        if errs: logging.warning("[acc %s] mute %s: %s", self.id, chat_id, errs)
 
     async def tick(self, chat_id):
         try:
             await self.call.played_time(chat_id)
-            self.state[chat_id] = "in"; self.err.pop(chat_id, None); return
+            self.state[chat_id] = "in"; self.err.pop(chat_id, None)
+            if not self.muted.get(chat_id): await self.mute(chat_id)
+            return
         except Exception:
             pass
         try:
@@ -506,6 +536,8 @@ async def screen_status():
             ok = w.state.get(cid) == "in"
             txt += f"   • <code>{cid}</code> — {'🎧 In VC' if ok else '⏳ Waiting for VC'}\n"
             if not ok and w.err.get(cid): txt += f"     <code>{esc(w.err[cid])[:120]}</code>\n"
+            if ok: txt += f"     {'🔇 mic off' if w.muted.get(cid) else '🎙 mic on'}\n"
+            if ok and w.mute_err.get(cid): txt += f"     <code>{esc(w.mute_err[cid])[:150]}</code>\n"
         txt += "\n"
     await show(txt, kb([[ib("🎧 JOIN NOW", "joinnow", style="success"), ib("🔄 REFRESH", "status", style="primary")],
                         [ib("⬅️ BACK", "home", style="danger")]]))
