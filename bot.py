@@ -62,6 +62,9 @@ def put_set(k, v):
 def del_set(k):
     db.execute("DELETE FROM settings WHERE key=?", (k,)); db.commit()
 
+def is_paused() -> bool:
+    return get_set("paused") == "1"
+
 # ---------------- UI ----------------
 def ib(text, cb=None, url=None, style=None):
     kw = {"text": fx(text)}
@@ -261,7 +264,8 @@ class Worker:
 
     async def keeper(self):
         while True:
-            for cid in list(self.targets): await self.tick(cid)
+            if not is_paused():
+                for cid in list(self.targets): await self.tick(cid)
             await asyncio.sleep(30)
 
     async def stop(self):
@@ -468,7 +472,9 @@ async def screen_targets(note=""):
                 try: title = (await w.app.get_chat(int(chat))).title or chat
                 except Exception: pass
             rows.append([ib(f"❌ {title}"[:40], f"rt:{aid}:{chat}", style="danger")])
+    if is_paused(): txt += "⏸ <b>Paused</b> · account VC se bahar hain, targets saved.\n\n"
     txt += "Remove karne ke liye ❌ dabao." if rows else "Koi target set nahi hai."
+    if rows: rows.append([ib("🎧 JOIN ALL", "joinall", style="success"), ib("🚪 LEAVE ALL", "leaveall", style="danger")])
     rows += [[ib("➕ ADD TARGET", "addt", style="primary")], [ib("⬅️ BACK", "home", style="danger")]]
     await show(txt, kb(rows))
 
@@ -519,10 +525,36 @@ async def t_chat(m: Message, state: FSMContext):
         return await show(f"❌ Chat nahi mila. Account us chat ka member hona chahiye.\n<code>{esc(e)}</code>\n\nDobara ID bhejo.", back_kb("targets"))
     db.execute("INSERT OR REPLACE INTO targets VALUES(?,?)", (acc, str(cid))); db.commit()
     w.targets.add(cid); await state.clear()
+    if is_paused():
+        return await screen_targets(f"✅ Target saved: <code>{cid}</code>\n⏸ Paused hai · JOIN ALL dabao.")
     await show("⏳ <b>VC join try ho raha hai…</b>")
     await w.tick(cid)
     if w.state.get(cid) == "in": await screen_targets(f"✅ Target set · 🎧 VC me join ho gaya: <code>{cid}</code>")
     else: await screen_targets(f"✅ Target set: <code>{cid}</code>\n⏳ Abhi join nahi hua:\n<code>{esc(w.err.get(cid, ''))[:200]}</code>")
+
+# ---- JOIN ALL / LEAVE ALL ----
+@router.callback_query(F.data == "leaveall")
+async def leave_all(c: CallbackQuery):
+    set_ui(c.message); await c.answer(fx("🚪 Leaving…"))
+    put_set("paused", "1")                                   # keeper dobara join na kare
+    await show("🚪 <b>Sabhi VC se nikal raha hoon…</b>")
+    n = 0
+    for w in list(workers.values()):
+        for cid in list(w.targets):
+            try: await asyncio.wait_for(w.call.leave_call(cid), 8); n += 1
+            except Exception: pass
+            w.state[cid] = "paused"; w.muted[cid] = False; w.err.pop(cid, None)
+    await screen_targets(f"✅ {n} VC se nikal gaye. Targets saved hain.")
+
+@router.callback_query(F.data == "joinall")
+async def join_all(c: CallbackQuery):
+    set_ui(c.message); await c.answer(fx("🎧 Joining…")); del_set("paused")
+    await show("🎧 <b>Sabhi VC me join ho raha hoon…</b>")
+    tot = ok = 0
+    for w in list(workers.values()):
+        for cid in list(w.targets):
+            tot += 1; await w.tick(cid); ok += 1 if w.state.get(cid) == "in" else 0
+    await screen_targets(f"🎧 {ok}/{tot} VC me join ho gaya." + ("" if ok == tot else "\n⏳ Baaki me VC chalu nahi hai, chalu hote hi join honge."))
 
 # ---- STATUS ----
 async def screen_status():
@@ -534,9 +566,10 @@ async def screen_status():
         if not w and errors.get(i): txt += f"<code>{esc(errors[i])[:150]}</code>\n"
         for cid in (w.targets if w else []):
             ok = w.state.get(cid) == "in"
-            txt += f"   • <code>{cid}</code> — {'🎧 In VC' if ok else '⏳ Waiting for VC'}\n"
-            if not ok and w.err.get(cid): txt += f"     <code>{esc(w.err[cid])[:120]}</code>\n"
-            if ok: txt += f"     {'🔇 mic off' if w.muted.get(cid) else '🎙 mic on'}\n"
+            label = "⏸ Paused" if is_paused() else ("🎧 In VC" if ok else "⏳ Waiting for VC")
+            txt += f"   • <code>{cid}</code> — {label}\n"
+            if not ok and not is_paused() and w.err.get(cid): txt += f"     <code>{esc(w.err[cid])[:120]}</code>\n"
+            if ok and not is_paused(): txt += f"     {'🔇 mic off' if w.muted.get(cid) else '🎙 mic on'}\n"
             if ok and w.mute_err.get(cid): txt += f"     <code>{esc(w.mute_err[cid])[:150]}</code>\n"
         txt += "\n"
     await show(txt, kb([[ib("🎧 JOIN NOW", "joinnow", style="success"), ib("🔄 REFRESH", "status", style="primary")],
@@ -548,7 +581,7 @@ async def status(c: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "joinnow")
 async def joinnow(c: CallbackQuery):
-    set_ui(c.message); await c.answer(fx("⏳ Joining…"))
+    set_ui(c.message); await c.answer(fx("⏳ Joining…")); del_set("paused")
     await show("⏳ <b>VC join try ho raha hai…</b>")
     for w in list(workers.values()):
         for cid in list(w.targets): await w.tick(cid)
